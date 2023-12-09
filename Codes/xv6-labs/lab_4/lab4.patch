@@ -1,0 +1,289 @@
+diff --git a/Makefile b/Makefile
+index cb0ab6d..0006afd 100644
+--- a/Makefile
++++ b/Makefile
+@@ -136,6 +136,7 @@ UPROGS=\
+ 	$U/_find\
+ 	$U/_sysinfotest\
+ 	$U/_pgtbltest\
++	$U/_bigfile\
+ 	
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/file.h b/kernel/file.h
+index b076d1d..65bc01f 100644
+--- a/kernel/file.h
++++ b/kernel/file.h
+@@ -14,6 +14,21 @@ struct file {
+ #define	mkdev(m,n)  ((uint)((m)<<16| (n)))
+ 
+ // in-memory copy of an inode
++// struct inode {
++//   uint dev;           // Device number
++//   uint inum;          // Inode number
++//   int ref;            // Reference count
++//   struct sleeplock lock; // protects everything below here
++//   int valid;          // inode has been read from disk?
++
++//   short type;         // copy of disk inode
++//   short major;
++//   short minor;
++//   short nlink;
++//   uint size;
++//   uint addrs[NDIRECT+1];
++// };
++
+ struct inode {
+   uint dev;           // Device number
+   uint inum;          // Inode number
+@@ -26,9 +41,10 @@ struct inode {
+   short minor;
+   short nlink;
+   uint size;
+-  uint addrs[NDIRECT+1];
++  uint addrs[NDIRECT+2]; // NDIRECT+1 -> NDIRECT+2
+ };
+ 
++
+ // map major device number to device functions.
+ struct devsw {
+   int (*read)(int, uint64, int);
+diff --git a/kernel/fs.c b/kernel/fs.c
+index c6bab15..f51aeb9 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -379,6 +379,48 @@ iunlockput(struct inode *ip)
+ // Return the disk block address of the nth block in inode ip.
+ // If there is no such block, bmap allocates one.
+ // returns 0 if out of disk space.
++//----------------------------
++// static uint
++// bmap(struct inode *ip, uint bn)
++// {
++//   uint addr, *a;
++//   struct buf *bp;
++
++//   if(bn < NDIRECT){
++//     if((addr = ip->addrs[bn]) == 0){
++//       addr = balloc(ip->dev);
++//       if(addr == 0)
++//         return 0;
++//       ip->addrs[bn] = addr;
++//     }
++//     return addr;
++//   }
++//   bn -= NDIRECT;
++
++//   if(bn < NINDIRECT){
++//     // Load indirect block, allocating if necessary.
++//     if((addr = ip->addrs[NDIRECT]) == 0){
++//       addr = balloc(ip->dev);
++//       if(addr == 0)
++//         return 0;
++//       ip->addrs[NDIRECT] = addr;
++//     }
++//     bp = bread(ip->dev, addr);
++//     a = (uint*)bp->data;
++//     if((addr = a[bn]) == 0){
++//       addr = balloc(ip->dev);
++//       if(addr){
++//         a[bn] = addr;
++//         log_write(bp);
++//       }
++//     }
++//     brelse(bp);
++//     return addr;
++//   }
++
++//   panic("bmap: out of range");
++// }
++//-----------------------------
+ static uint
+ bmap(struct inode *ip, uint bn)
+ {
+@@ -386,32 +428,44 @@ bmap(struct inode *ip, uint bn)
+   struct buf *bp;
+ 
+   if(bn < NDIRECT){
+-    if((addr = ip->addrs[bn]) == 0){
+-      addr = balloc(ip->dev);
+-      if(addr == 0)
+-        return 0;
+-      ip->addrs[bn] = addr;
+-    }
++    if((addr = ip->addrs[bn]) == 0)
++      ip->addrs[bn] = addr = balloc(ip->dev);
+     return addr;
+   }
+   bn -= NDIRECT;
+ 
+-  if(bn < NINDIRECT){
++  if(bn < NINDIRECT){ // singly-indirect
++    // Load indirect block, allocating if necessary.
++    if((addr = ip->addrs[NDIRECT]) == 0)
++      ip->addrs[NDIRECT] = addr = balloc(ip->dev);
++    bp = bread(ip->dev, addr);
++    a = (uint*)bp->data;
++    if((addr = a[bn]) == 0){
++      a[bn] = addr = balloc(ip->dev);
++      log_write(bp);
++    }
++    brelse(bp);
++    return addr;
++  }
++  bn -= NINDIRECT;
++
++  if(bn < NINDIRECT * NINDIRECT) { // doubly-indirect
+     // Load indirect block, allocating if necessary.
+-    if((addr = ip->addrs[NDIRECT]) == 0){
+-      addr = balloc(ip->dev);
+-      if(addr == 0)
+-        return 0;
+-      ip->addrs[NDIRECT] = addr;
++    if((addr = ip->addrs[NDIRECT+1]) == 0)
++      ip->addrs[NDIRECT+1] = addr = balloc(ip->dev);
++    bp = bread(ip->dev, addr);
++    a = (uint*)bp->data;
++    if((addr = a[bn/NINDIRECT]) == 0){
++      a[bn/NINDIRECT] = addr = balloc(ip->dev);
++      log_write(bp);
+     }
++    brelse(bp);
++    bn %= NINDIRECT;
+     bp = bread(ip->dev, addr);
+     a = (uint*)bp->data;
+     if((addr = a[bn]) == 0){
+-      addr = balloc(ip->dev);
+-      if(addr){
+-        a[bn] = addr;
+-        log_write(bp);
+-      }
++      a[bn] = addr = balloc(ip->dev);
++      log_write(bp);
+     }
+     brelse(bp);
+     return addr;
+@@ -420,8 +474,41 @@ bmap(struct inode *ip, uint bn)
+   panic("bmap: out of range");
+ }
+ 
++
++
+ // Truncate inode (discard contents).
+ // Caller must hold ip->lock.
++// ---------------------------
++// void
++// itrunc(struct inode *ip)
++// {
++//   int i, j;
++//   struct buf *bp;
++//   uint *a;
++
++//   for(i = 0; i < NDIRECT; i++){
++//     if(ip->addrs[i]){
++//       bfree(ip->dev, ip->addrs[i]);
++//       ip->addrs[i] = 0;
++//     }
++//   }
++
++//   if(ip->addrs[NDIRECT]){
++//     bp = bread(ip->dev, ip->addrs[NDIRECT]);
++//     a = (uint*)bp->data;
++//     for(j = 0; j < NINDIRECT; j++){
++//       if(a[j])
++//         bfree(ip->dev, a[j]);
++//     }
++//     brelse(bp);
++//     bfree(ip->dev, ip->addrs[NDIRECT]);
++//     ip->addrs[NDIRECT] = 0;
++//   }
++
++//   ip->size = 0;
++//   iupdate(ip);
++// }
++//---------------------------
+ void
+ itrunc(struct inode *ip)
+ {
+@@ -448,10 +535,31 @@ itrunc(struct inode *ip)
+     ip->addrs[NDIRECT] = 0;
+   }
+ 
++  if(ip->addrs[NDIRECT+1]){
++    bp = bread(ip->dev, ip->addrs[NDIRECT+1]);
++    a = (uint*)bp->data;
++    for(j = 0; j < NINDIRECT; j++){
++      if(a[j]) {
++        struct buf *bp2 = bread(ip->dev, a[j]);
++        uint *a2 = (uint*)bp2->data;
++        for(int k = 0; k < NINDIRECT; k++){
++          if(a2[k])
++            bfree(ip->dev, a2[k]);
++        }
++        brelse(bp2);
++        bfree(ip->dev, a[j]);
++      }
++    }
++    brelse(bp);
++    bfree(ip->dev, ip->addrs[NDIRECT+1]);
++    ip->addrs[NDIRECT] = 0;
++  }
++
+   ip->size = 0;
+   iupdate(ip);
+ }
+ 
++
+ // Copy stat information from inode.
+ // Caller must hold ip->lock.
+ void
+diff --git a/kernel/fs.h b/kernel/fs.h
+index 139dcc9..86b61fb 100644
+--- a/kernel/fs.h
++++ b/kernel/fs.h
+@@ -24,9 +24,23 @@ struct superblock {
+ 
+ #define FSMAGIC 0x10203040
+ 
+-#define NDIRECT 12
++// #define NDIRECT 12
++// #define NINDIRECT (BSIZE / sizeof(uint))
++// #define MAXFILE (NDIRECT + NINDIRECT)
++
++// // On-disk inode structure
++// struct dinode {
++//   short type;           // File type
++//   short major;          // Major device number (T_DEVICE only)
++//   short minor;          // Minor device number (T_DEVICE only)
++//   short nlink;          // Number of links to inode in file system
++//   uint size;            // Size of file (bytes)
++//   uint addrs[NDIRECT+1];   // Data block addresses
++// };
++
++#define NDIRECT 11 // 12 -> 11
+ #define NINDIRECT (BSIZE / sizeof(uint))
+-#define MAXFILE (NDIRECT + NINDIRECT)
++#define MAXFILE (NDIRECT + NINDIRECT + NINDIRECT * NINDIRECT)
+ 
+ // On-disk inode structure
+ struct dinode {
+@@ -35,7 +49,7 @@ struct dinode {
+   short minor;          // Minor device number (T_DEVICE only)
+   short nlink;          // Number of links to inode in file system
+   uint size;            // Size of file (bytes)
+-  uint addrs[NDIRECT+1];   // Data block addresses
++  uint addrs[NDIRECT+2];   // Data block addresses (NDIRECT+1 -> NDIRECT+2)
+ };
+ 
+ // Inodes per block.
+diff --git a/kernel/param.h b/kernel/param.h
+index 6624bff..2108959 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -9,5 +9,5 @@
+ #define MAXOPBLOCKS  10  // max # of blocks any FS op writes
+ #define LOGSIZE      (MAXOPBLOCKS*3)  // max data blocks in on-disk log
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+-#define FSSIZE       2000  // size of file system in blocks
++#define FSSIZE       150000  // size of file system in blocks
+ #define MAXPATH      128   // maximum file path name

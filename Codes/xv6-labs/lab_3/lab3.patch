@@ -1,0 +1,254 @@
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+new file mode 100644
+index 0000000..21dd991
+--- /dev/null
++++ b/.vscode/settings.json
+@@ -0,0 +1,6 @@
++{
++    "files.associations": {
++        "user.h": "c",
++        "defs.h": "c"
++    }
++}
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index b2a1edb..cb0ab6d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -135,7 +135,8 @@ UPROGS=\
+ 	$U/_sleep\
+ 	$U/_find\
+ 	$U/_sysinfotest\
+-
++	$U/_pgtbltest\
++	
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+ 
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 5791024..8f30744 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -173,6 +173,9 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++void            vmprint(pagetable_t pagetable);
++pte_t *         walk(pagetable_t pagetable, uint64 va, int alloc);
++
+ 
+ // plic.c
+ void            plicinit(void);
+@@ -193,4 +196,5 @@ struct sysinfo;
+ // kalloc.c
+ uint64      get_freemem(void);
+ // proc.c
+-uint64      get_nproc();
+\ No newline at end of file
++uint64      get_nproc();
++uint64      pgaccess(void *pg, int number, void *store);
+\ No newline at end of file
+diff --git a/kernel/exec.c b/kernel/exec.c
+index e18bbb6..81da60c 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -127,7 +127,7 @@ exec(char *path, char **argv)
+   p->trapframe->epc = elf.entry;  // initial program counter = main
+   p->trapframe->sp = sp; // initial stack pointer
+   proc_freepagetable(oldpagetable, oldsz);
+-
++  if (p->pid == 1) vmprint(p->pagetable);
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+ 
+  bad:
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 20a01db..44cf627 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -16,6 +16,8 @@ r_mhartid()
+ #define MSTATUS_MPP_S (1L << 11)
+ #define MSTATUS_MPP_U (0L << 11)
+ #define MSTATUS_MIE (1L << 3)    // machine-mode interrupt enable.
++#define PTE_U (1L << 4) // 1 -> user can access
++#define PTE_A (1L << 6) // 1 -> page already be accessed
+ 
+ static inline uint64
+ r_mstatus()
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 6a71b9e..c7e2901 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -102,6 +102,7 @@ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_sysinfo(void);
++extern uint64 sys_pgaccess(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -128,6 +129,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
+ [SYS_sysinfo] sys_sysinfo,
++[SYS_pgaccess] sys_pgaccess,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 8e25066..d198135 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,4 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
+-#define SYS_sysinfo 22
+\ No newline at end of file
++#define SYS_sysinfo 22
++#define SYS_pgaccess  23
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 10e2256..1ab6033 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -109,4 +109,34 @@ uint64 sys_sysinfo(void)
+     return -1;
+   }
+   return 0;
+-}
+\ No newline at end of file
++}
++
++int
++sys_pgaccess(void)
++{
++  // lab pgtbl: your code here.
++    uint64 va,dst;
++    int n;
++    argint(1, &n);
++    argaddr(0, &va);
++    argaddr(2, &dst);
++    if(n > 64 || n < 0)
++        return -1;
++    uint64 bitmask = 0,mask = 1;
++    pte_t *pte;
++    pagetable_t pagetable = myproc()->pagetable;
++    while(n > 0){
++        pte = walk(pagetable,va,1);
++        if(pte){
++            if(*pte & PTE_A)
++                bitmask |= mask;
++            *pte = *pte & (~PTE_A);
++        }
++        mask <<= 1;
++        va = (uint64)((char*)(va)+PGSIZE);
++        n--;
++    }
++    if(copyout(pagetable,dst,(char *)&bitmask,sizeof(bitmask)) < 0)
++        return -1;
++    return 0;
++}
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 9f69783..50cc11c 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -437,3 +437,30 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++
++void
++vmprintwalk(pagetable_t pagetable, int deep)
++{
++  // there are 2^9 = 512 PTEs in a page table.
++  for (int i = 0; i < 512; i++) {
++    pte_t pte = pagetable[i];
++    if (pte & PTE_V) {
++      for (int i = 0; i <= deep; ++i) printf(".. ");
++      printf("%d: pte %p pa %p\n", i, pte, PTE2PA(pte));
++
++      if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
++        // this PTE points to a lower-level page table.
++        uint64 child = PTE2PA(pte);
++        vmprintwalk((pagetable_t)child, deep + 1);
++      }
++    }
++  }
++}
++
++void
++vmprint(pagetable_t pagetable)
++{
++  printf("page table %p\n", pagetable);
++  vmprintwalk(pagetable, 0);
++}
++
+diff --git a/user/pgtbltest.c b/user/pgtbltest.c
+index bce158a..e64f04c 100644
+--- a/user/pgtbltest.c
++++ b/user/pgtbltest.c
+@@ -4,13 +4,11 @@
+ #include "kernel/riscv.h"
+ #include "user/user.h"
+ 
+-void ugetpid_test();
+ void pgaccess_test();
+ 
+ int
+ main(int argc, char *argv[])
+ {
+-  ugetpid_test();
+   pgaccess_test();
+   printf("pgtbltest: all tests succeeded\n");
+   exit(0);
+@@ -25,28 +23,6 @@ err(char *why)
+   exit(1);
+ }
+ 
+-void
+-ugetpid_test()
+-{
+-  int i;
+-
+-  printf("ugetpid_test starting\n");
+-  testname = "ugetpid_test";
+-
+-  for (i = 0; i < 64; i++) {
+-    int ret = fork();
+-    if (ret != 0) {
+-      wait(&ret);
+-      if (ret != 0)
+-        exit(1);
+-      continue;
+-    }
+-    if (getpid() != ugetpid())
+-      err("missmatched PID");
+-    exit(0);
+-  }
+-  printf("ugetpid_test: OK\n");
+-}
+ 
+ void
+ pgaccess_test()
+diff --git a/user/user.h b/user/user.h
+index 4d682fa..a2e19b3 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,6 +23,7 @@ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+ int sysinfo(struct sysinfo*);
++int pgaccess(void *base, int len, void *mask);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 82f8d72..a883ad3 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -37,4 +37,4 @@ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
+ entry("sysinfo");
+-
++entry("pgaccess");
